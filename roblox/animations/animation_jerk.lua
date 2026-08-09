@@ -7,8 +7,6 @@
       \/_/      \/_/\/_/   \/____/   \/_/ /_/   \/_/   \/_/       \/_/   \/_____/ 
                                    dsc.gg/vadriftz
 ]]
-
--- Basically an Roblox Script which gives you a tool that allows you to Jerk Off
 -- Supports All Executors, Open Sourced, Works on R6 and R15, Works on all rig types
 
 local speaker = game.Players.LocalPlayer

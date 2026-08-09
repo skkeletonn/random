@@ -7,7 +7,6 @@
       \/_/      \/_/\/_/   \/____/   \/_/ /_/   \/_/   \/_/       \/_/   \/_____/ 
                                    dsc.gg/vadriftz
 ]]
-
 -- Supports All Executors, Open Sourced, Works on R6 ONLY, Works on all rig types
 
 HugTool = Instance.new("Tool")

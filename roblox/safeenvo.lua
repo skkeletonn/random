@@ -4,7 +4,7 @@
 \ \ \'/   \ \  __ \  \ \ \/\ \ \ \  __<   \ \ \  \ \  __\ \/_/\ \/ \ \___  \
  \ \__|    \ \_\ \_\  \ \____-  \ \_\ \_\  \ \_\  \ \_\      \ \_\  \/\_____\ 
   \/_/      \/_/\/_/   \/____/   \/_/ /_/   \/_/   \/_/       \/_/   \/_____/ 
-                            Made by vxmpjay ♥ v0.3
+                            Made by skeleton ♥ v0.3
 Blocks a BUNCH of Remote SPy's, Blocks some HTTP Spies (inconsistent) (specifically blocks 25ms one 100%)
 ]]
 

@@ -36,6 +36,7 @@ let ChannelStore = findExport(x => x?.__proto__?.getAllThreadsForParent);
 let GuildChannelStore = findExport(x => x?.getSFWDefaultChannel);
 let FluxDispatcher = findExport(x => x?.__proto__?.flushWaitQueue);
 let TokenStore = findExport(x => typeof x?.getToken === "function");
+let UserStore = findExport(x => typeof x?.getCurrentUser === "function" && typeof x?.__proto__?.getUser === "function");
 
 let token = TokenStore?.getToken();
 if (!token) {
@@ -62,6 +63,81 @@ let api = {
 const supportedTasks = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"];
 let isApp = typeof DiscordNative !== "undefined";
 
+// --- helpers added for the 2026 quest config changes ---
+
+// Discord moved the app off config.application in July 2026. It now lives
+// per-task at taskConfig.tasks[<KEY>].applications[0], with the old
+// config.application.id kept as a legacy fallback for older clients.
+function appIdFor(taskConfig, taskName, legacyAppId) {
+	return taskConfig?.tasks?.[taskName]?.applications?.[0]?.id ?? legacyAppId ?? null;
+}
+
+// Task keys can drift (e.g. PLAY_ON_DESKTOP_V2). Exact keys first, then
+// family/prefix matching so variants still get routed to the right handler.
+function pickTaskName(taskConfig) {
+	const keys = Object.keys(taskConfig?.tasks ?? {});
+	for (const k of supportedTasks) if (taskConfig.tasks[k] != null) return k;
+	const order = [
+		(k) => k === "ACHIEVEMENT_IN_ACTIVITY",
+		(k) => k === "PLAY_ACTIVITY",
+		(k) => k.startsWith("STREAM"),
+		(k) => k.includes("VIDEO"),
+		(k) => k.startsWith("PLAY"),
+		(k) => k.includes("ACTIVITY"),
+	];
+	for (const m of order) {
+		const k = keys.find(m);
+		if (k) return k;
+	}
+	return null;
+}
+
+function questHasSupportedTask(x) {
+	const cfg = x.config?.taskConfig ?? x.config?.taskConfigV2;
+	return pickTaskName(cfg) != null;
+}
+
+// userStatus.progress can be a Map in store payloads and a plain object over
+// REST; read defensively.
+function readProgress(userStatus, key) {
+	const p = userStatus?.progress;
+	const entry = p instanceof Map ? p.get(key) : p?.[key];
+	return entry?.value ?? 0;
+}
+
+// Stream keys are `call:<dmChannelId>:<ownerId>` for DMs and
+// `guild:<guildId>:<channelId>:<ownerId>` for guild voice channels. The old
+// `call:<channel>:1` put a random 4-digit number where a user snowflake belongs.
+function buildStreamKey() {
+	try {
+		const ownerId = UserStore?.getCurrentUser?.()?.id ?? getUserIdFromToken();
+		if (!ownerId) return null;
+
+		const dm = ChannelStore?.getSortedPrivateChannels?.()?.[0]?.id;
+		if (dm) return `call:${dm}:${ownerId}`;
+
+		for (const g of Object.values(GuildChannelStore?.getAllGuilds?.() ?? {})) {
+			const vc = g?.VOCAL?.[0]?.channel ?? g?.VOCAL?.[0];
+			const guildId = vc?.guild_id ?? g?.id;
+			if (vc?.id && guildId) return `guild:${guildId}:${vc.id}:${ownerId}`;
+		}
+		return null;
+	} catch (e) {
+		console.log("Stream key lookup failed:", e);
+		return null;
+	}
+}
+
+function getUserIdFromToken() {
+	try {
+		const b64 = token.split(".")[0].replace(/-/g, "+").replace(/_/g, "/");
+		const padded = b64.padEnd(Math.ceil(b64.length / 4) * 4, "=");
+		return atob(padded);
+	} catch (e) {
+		return null;
+	}
+}
+
 async function getQuests() {
 	if (QuestsStore?.quests) {
 		let quests = [...QuestsStore.quests.values()].filter(
@@ -69,7 +145,7 @@ async function getQuests() {
 				x.userStatus?.enrolledAt &&
 				!x.userStatus?.completedAt &&
 				new Date(x.config.expiresAt).getTime() > Date.now() &&
-				supportedTasks.find((y) => Object.keys((x.config.taskConfig ?? x.config.taskConfigV2).tasks).includes(y))
+				questHasSupportedTask(x)
 		);
 		if (quests.length > 0) return quests;
 	}
@@ -86,7 +162,7 @@ async function getQuests() {
 			x.userStatus?.enrolledAt &&
 			!x.userStatus?.completedAt &&
 			new Date(x.config.expiresAt).getTime() > Date.now() &&
-			supportedTasks.find((y) => Object.keys((x.config.taskConfig ?? x.config.taskConfigV2).tasks).includes(y))
+			questHasSupportedTask(x)
 	);
 }
 
@@ -105,13 +181,27 @@ async function getQuests() {
 		if (!quest) return;
 
 		const pid = Math.floor(Math.random() * 30000) + 1000;
-		const applicationId = quest.config.application.id;
-		const applicationName = quest.config.application.name;
 		const questName = quest.config.messages.questName;
 		const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
-		const taskName = supportedTasks.find((x) => taskConfig.tasks[x] != null);
-		const secondsNeeded = taskConfig.tasks[taskName].target;
-		let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+		const taskName = pickTaskName(taskConfig);
+		const secondsNeeded = taskConfig.tasks[taskName]?.target ?? 0;
+		let secondsDone = readProgress(quest.userStatus, taskName);
+
+		// FIXED: app id/name moved off config.application onto the task
+		const applicationId = appIdFor(taskConfig, taskName, quest.config?.application?.id);
+		const applicationName = quest.config?.application?.name ?? quest.config?.messages?.questName ?? "Unknown App";
+
+		if (!taskName || !secondsNeeded) {
+			console.log(`Skipping "${questName}": unsupported or missing task config.`);
+			doJob();
+			return;
+		}
+
+		if (!applicationId && taskName !== "WATCH_VIDEO" && taskName !== "WATCH_VIDEO_ON_MOBILE") {
+			console.log(`Skipping "${questName}": no application id in its config, Discord couldn't match a spoofed process/stream to it.`);
+			doJob();
+			return;
+		}
 
 		if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
 			const maxFuture = 10, speed = 7, interval = 1;
@@ -137,7 +227,7 @@ async function getQuests() {
 			console.log("Quest completed!");
 			doJob();
 
-		} else if (taskName === "PLAY_ON_DESKTOP") {
+		} else if (taskName.startsWith("PLAY") && taskName !== "PLAY_ACTIVITY") {
 			if (!isApp) {
 				console.log("This needs the desktop app for", questName);
 				doJob();
@@ -187,18 +277,17 @@ async function getQuests() {
 
 			console.log(`Spoofed game to ${appName}. Sending heartbeats every 20s for ~${Math.ceil((secondsNeeded - secondsDone) / 60)} minutes.`);
 
-			const channelId = ChannelStore?.getSortedPrivateChannels?.()?.[0]?.id ?? Object.values(GuildChannelStore?.getAllGuilds?.() ?? {}).find((x) => x != null && x.VOCAL?.length > 0)?.VOCAL[0]?.channel?.id ?? "0";
-			const streamKey = `call:${channelId}:1`;
+			const streamKey = buildStreamKey() ?? "call:0:0";
 
 			while (true) {
 				try {
-					let hbRes = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
+					let hbRes = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, application_id: String(applicationId ?? ""), terminal: false } });
 					let progress = hbRes.body?.progress?.[taskName]?.value ?? secondsDone;
 					secondsDone = progress;
 					console.log(`Quest progress: ${Math.floor(progress)}/${secondsNeeded}`);
 
 					if (progress >= secondsNeeded) {
-						await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: true } });
+						await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, application_id: String(applicationId ?? ""), terminal: true } });
 						break;
 					}
 				} catch (e) {
@@ -216,7 +305,7 @@ async function getQuests() {
 			console.log("Quest completed!");
 			doJob();
 
-		} else if (taskName === "STREAM_ON_DESKTOP") {
+		} else if (taskName.startsWith("STREAM")) {
 			if (!isApp) {
 				console.log("This needs the desktop app for", questName);
 				doJob();
@@ -233,21 +322,20 @@ async function getQuests() {
 				});
 			}
 
-			const channelId = ChannelStore?.getSortedPrivateChannels?.()?.[0]?.id ?? Object.values(GuildChannelStore?.getAllGuilds?.() ?? {}).find((x) => x != null && x.VOCAL?.length > 0)?.VOCAL[0]?.channel?.id ?? "0";
-			const streamKey = `call:${channelId}:1`;
+			const streamKey = buildStreamKey() ?? "call:0:0";
 
 			console.log(`Spoofed stream to ${applicationName}. Sending heartbeats every 20s for ~${Math.ceil((secondsNeeded - secondsDone) / 60)} minutes.`);
 			console.log("Remember you need at least 1 other person in the vc!");
 
 			while (true) {
 				try {
-					let hbRes = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
+					let hbRes = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, application_id: String(applicationId ?? ""), terminal: false } });
 					let progress = hbRes.body?.progress?.[taskName]?.value ?? secondsDone;
 					secondsDone = progress;
 					console.log(`Quest progress: ${Math.floor(progress)}/${secondsNeeded}`);
 
 					if (progress >= secondsNeeded) {
-						await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: true } });
+						await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, application_id: String(applicationId ?? ""), terminal: true } });
 						break;
 					}
 				} catch (e) {
@@ -264,19 +352,18 @@ async function getQuests() {
 			doJob();
 
 		} else if (taskName === "PLAY_ACTIVITY") {
-			const channelId = ChannelStore?.getSortedPrivateChannels?.()?.[0]?.id ?? Object.values(GuildChannelStore?.getAllGuilds?.() ?? {}).find((x) => x != null && x.VOCAL?.length > 0)?.VOCAL[0]?.channel?.id ?? "0";
-			const streamKey = `call:${channelId}:1`;
+			const streamKey = buildStreamKey() ?? "call:0:0";
 
 			console.log("Completing quest", questName);
 
 			while (true) {
 				try {
-					const res = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
-					const progress = res.body?.progress?.PLAY_ACTIVITY?.value ?? secondsDone;
+					const res = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, application_id: String(applicationId ?? ""), terminal: false } });
+					const progress = res.body?.progress?.[taskName]?.value ?? res.body?.progress?.PLAY_ACTIVITY?.value ?? secondsDone;
 					console.log(`Quest progress: ${progress}/${secondsNeeded}`);
 
 					if (progress >= secondsNeeded) {
-						await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: true } });
+						await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, application_id: String(applicationId ?? ""), terminal: true } });
 						break;
 					}
 				} catch (e) {

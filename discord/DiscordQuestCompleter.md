@@ -63,17 +63,10 @@ let api = {
 const supportedTasks = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"];
 let isApp = typeof DiscordNative !== "undefined";
 
-// --- helpers added for the 2026 quest config changes ---
-
-// Discord moved the app off config.application in July 2026. It now lives
-// per-task at taskConfig.tasks[<KEY>].applications[0], with the old
-// config.application.id kept as a legacy fallback for older clients.
 function appIdFor(taskConfig, taskName, legacyAppId) {
 	return taskConfig?.tasks?.[taskName]?.applications?.[0]?.id ?? legacyAppId ?? null;
 }
 
-// Task keys can drift (e.g. PLAY_ON_DESKTOP_V2). Exact keys first, then
-// family/prefix matching so variants still get routed to the right handler.
 function pickTaskName(taskConfig) {
 	const keys = Object.keys(taskConfig?.tasks ?? {});
 	for (const k of supportedTasks) if (taskConfig.tasks[k] != null) return k;
@@ -97,17 +90,12 @@ function questHasSupportedTask(x) {
 	return pickTaskName(cfg) != null;
 }
 
-// userStatus.progress can be a Map in store payloads and a plain object over
-// REST; read defensively.
 function readProgress(userStatus, key) {
 	const p = userStatus?.progress;
 	const entry = p instanceof Map ? p.get(key) : p?.[key];
 	return entry?.value ?? 0;
 }
 
-// Stream keys are `call:<dmChannelId>:<ownerId>` for DMs and
-// `guild:<guildId>:<channelId>:<ownerId>` for guild voice channels. The old
-// `call:<channel>:1` put a random 4-digit number where a user snowflake belongs.
 function buildStreamKey() {
 	try {
 		const ownerId = UserStore?.getCurrentUser?.()?.id ?? getUserIdFromToken();
@@ -187,7 +175,6 @@ async function getQuests() {
 		const secondsNeeded = taskConfig.tasks[taskName]?.target ?? 0;
 		let secondsDone = readProgress(quest.userStatus, taskName);
 
-		// FIXED: app id/name moved off config.application onto the task
 		const applicationId = appIdFor(taskConfig, taskName, quest.config?.application?.id);
 		const applicationName = quest.config?.application?.name ?? quest.config?.messages?.questName ?? "Unknown App";
 

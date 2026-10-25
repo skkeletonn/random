@@ -11,7 +11,7 @@ How to use this script:
 // ==UserScript==
 // @name         LALAL.ai Stem Downloader
 // @namespace    stemdownloader
-// @version      1.4.0
+// @version      1.5.0
 // @description  A compact, plain-language panel for saving captured LALAL.ai stems.
 // @match        *://www.lalal.ai/*
 // @match        *://lalal.ai/*
@@ -203,7 +203,7 @@ How to use this script:
             help.appendChild(make('p', '', 'Stems are numbered as they arrive. Listen to tell which one is vocals, music, or another part.'));
             help.appendChild(make('p', '', 'Only collected audio is saved. The part count does not confirm that the whole track is here.'));
             help.appendChild(make('p', '', hasMP3() ? 'Files save as 192 kbps MP3.' : 'MP3 export is unavailable, so files save as WAV. WAV does not improve the source quality.'));
-            help.appendChild(make('p', '', 'The same join setting is used as before. If a join sounds cut off, the 10 ms trim can be changed in the script.'));
+            help.appendChild(make('p', '', 'Each join between parts trims ' + JOIN_TRIM_MS + ' ms. If a join sounds cut off, change JOIN_TRIM_MS at the top of the script.'));
             details.appendChild(help); details.addEventListener('toggle', function() { detailsOpen = details.open; }); panel.appendChild(details);
             var status = make('div', 'sd-status', statusMessage); status.dataset.kind = statusKind;
             status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); panel.appendChild(status);
@@ -236,144 +236,186 @@ How to use this script:
             } catch (e) { reject(e); }
         });
     }
+
+    // ---- Keeps the page responsive during heavy work ----
+    function yieldToUI() {
+        return new Promise(function(resolve) {
+            var ch = new MessageChannel();
+            ch.port1.onmessage = function() { ch.port1.close(); resolve(); };
+            ch.port2.postMessage(0);
+        });
+    }
+    function makeSlicer(budgetMs) {
+        var last = performance.now();
+        return async function tick() {
+            if (performance.now() - last > budgetMs) { await yieldToUI(); last = performance.now(); }
+        };
+    }
+    function pause(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+
     async function decodeAndJoin(base) {
         var segments = trackGroups[base] || {};
         var nums = Object.keys(segments).map(Number).filter(Number.isFinite).sort(function(a,b) { return a-b; });
         if (!nums.length) throw new Error('Play this stem first, then try again.');
-        var raw = nums.map(function(n) { return segments[n].slice(0); });
         var ctx = getAudioContext();
         if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) {} }
-        var decoded = await Promise.all(raw.map(function(b) { return decodeAudio(ctx,b); }));
+
+        // Decode one part at a time so CPU spikes and memory use stay small.
+        var decoded = [];
+        for (var n = 0; n < nums.length; n++) {
+            decoded.push(await decodeAudio(ctx, segments[nums[n]].slice(0)));
+            await yieldToUI();
+        }
         var sampleRate = decoded[0].sampleRate;
         if (decoded.some(function(b) { return b.sampleRate !== sampleRate; })) throw new Error('These audio parts could not be joined.');
         var channels = decoded.some(function(b) { return b.numberOfChannels > 1; }) ? 2 : 1;
         var trimFrames = Math.round(sampleRate * JOIN_TRIM_MS / 1000);
-        var totalFrames = 0;
+        var totalFrames = 0, removedFrames = 0;
         var pieces = decoded.map(function(b, i) {
             var start = i === 0 ? 0 : Math.min(trimFrames, b.length);
-            var length = b.length-start; totalFrames += length;
-            return {buffer:b, start:start, length:length};
+            var length = b.length - start;
+            totalFrames += length; removedFrames += start;
+            return {buffer: b, start: start, length: length};
         });
-        var pcm = Array.from({length:channels}, function() { return new Float32Array(totalFrames); });
+        console.log('[Stem Downloader] ' + decoded.length + ' parts, ' + (decoded.length - 1) + ' joins, ' +
+            (removedFrames / sampleRate * 1000).toFixed(2) + ' ms removed in total, ' +
+            (totalFrames / sampleRate).toFixed(3) + ' s final length');
+        decoded = null;
+
+        var pcm = Array.from({length: channels}, function() { return new Float32Array(totalFrames); });
         var writeAt = 0;
-        pieces.forEach(function(piece) {
+        for (var p = 0; p < pieces.length; p++) {
+            var piece = pieces[p];
             for (var ch = 0; ch < channels; ch++) {
-                var source = piece.buffer.getChannelData(Math.min(ch,piece.buffer.numberOfChannels-1));
-                pcm[ch].set(source.subarray(piece.start,piece.start+piece.length),writeAt);
+                var source = piece.buffer.getChannelData(Math.min(ch, piece.buffer.numberOfChannels - 1));
+                pcm[ch].set(source.subarray(piece.start, piece.start + piece.length), writeAt);
             }
             writeAt += piece.length;
-        });
-        return {pcm:pcm, sampleRate:sampleRate, channels:channels};
+            piece.buffer = null; // free memory as we go
+            if (p % 4 === 3) await yieldToUI();
+        }
+        return {pcm: pcm, sampleRate: sampleRate, channels: channels};
     }
     function floatToInt16(data) {
         var out = new Int16Array(data.length);
-        for (var i=0;i<data.length;i++) {
-            var value = Math.max(-1,Math.min(1,data[i])); out[i] = value < 0 ? value*32768 : value*32767;
+        for (var i = 0; i < data.length; i++) {
+            var value = Math.max(-1, Math.min(1, data[i]));
+            out[i] = value < 0 ? value * 32768 : value * 32767;
         }
         return out;
     }
-    function encodeMP3(joined) {
+    async function encodeMP3(joined) {
         var lib = getLame(); if (!lib || !lib.Mp3Encoder) return null;
-        var encoder = new lib.Mp3Encoder(joined.channels,joined.sampleRate,MP3_BITRATE_KBPS);
-        var left = floatToInt16(joined.pcm[0]);
-        var right = joined.channels > 1 ? floatToInt16(joined.pcm[1]) : null;
-        var chunks = [];
-        for (var i=0;i<left.length;i+=1152) {
-            var end = Math.min(i+1152,left.length);
-            var data = right ? encoder.encodeBuffer(left.subarray(i,end),right.subarray(i,end)) : encoder.encodeBuffer(left.subarray(i,end));
+        var encoder = new lib.Mp3Encoder(joined.channels, joined.sampleRate, MP3_BITRATE_KBPS);
+        var total = joined.pcm[0].length, stereo = joined.channels > 1;
+        var chunks = [], tick = makeSlicer(10);
+        for (var i = 0; i < total; i += 1152) {
+            var end = Math.min(i + 1152, total);
+            var l = floatToInt16(joined.pcm[0].subarray(i, end));
+            var data = stereo
+                ? encoder.encodeBuffer(l, floatToInt16(joined.pcm[1].subarray(i, end)))
+                : encoder.encodeBuffer(l);
             if (data.length) chunks.push(new Int8Array(data));
+            await tick();
         }
         var last = encoder.flush(); if (last.length) chunks.push(new Int8Array(last));
-        return new Blob(chunks,{type:'audio/mpeg'});
+        return new Blob(chunks, {type: 'audio/mpeg'});
     }
-    function encodeWAV(joined) {
+    async function encodeWAV(joined) {
         var channels = joined.channels, frames = joined.pcm[0].length;
-        var blockAlign = channels*2, dataSize = frames*blockAlign;
-        if (dataSize > 0xffffffff-36) throw new Error('This audio is too large for one WAV file.');
-        var buffer = new ArrayBuffer(44+dataSize), view = new DataView(buffer);
-        function ascii(offset,text) { for (var i=0;i<text.length;i++) view.setUint8(offset+i,text.charCodeAt(i)); }
-        ascii(0,'RIFF');view.setUint32(4,36+dataSize,true);ascii(8,'WAVE');ascii(12,'fmt ');
-        view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,channels,true);
-        view.setUint32(24,joined.sampleRate,true);view.setUint32(28,joined.sampleRate*blockAlign,true);
-        view.setUint16(32,blockAlign,true);view.setUint16(34,16,true);ascii(36,'data');view.setUint32(40,dataSize,true);
-        var offset=44;
-        for (var i=0;i<frames;i++) for (var ch=0;ch<channels;ch++) {
-            var value=Math.max(-1,Math.min(1,joined.pcm[ch][i]));
-            view.setInt16(offset,value<0?value*32768:value*32767,true);offset+=2;
+        var blockAlign = channels * 2, dataSize = frames * blockAlign;
+        if (dataSize > 0xffffffff - 36) throw new Error('This audio is too large for one WAV file.');
+        var buffer = new ArrayBuffer(44 + dataSize), view = new DataView(buffer);
+        function ascii(offset, text) { for (var i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i)); }
+        ascii(0,'RIFF'); view.setUint32(4,36+dataSize,true); ascii(8,'WAVE'); ascii(12,'fmt ');
+        view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,channels,true);
+        view.setUint32(24,joined.sampleRate,true); view.setUint32(28,joined.sampleRate*blockAlign,true);
+        view.setUint16(32,blockAlign,true); view.setUint16(34,16,true); ascii(36,'data'); view.setUint32(40,dataSize,true);
+        var offset = 44, tick = makeSlicer(10);
+        for (var start = 0; start < frames; start += 8192) {
+            var stop = Math.min(start + 8192, frames);
+            for (var i = start; i < stop; i++) for (var ch = 0; ch < channels; ch++) {
+                var value = Math.max(-1, Math.min(1, joined.pcm[ch][i]));
+                view.setInt16(offset, value < 0 ? value * 32768 : value * 32767, true); offset += 2;
+            }
+            await tick();
         }
-        return new Blob([buffer],{type:'audio/wav'});
+        return new Blob([buffer], {type: 'audio/wav'});
     }
-    function saveBlob(blob,filename) {
-        var href=URL.createObjectURL(blob), a=make('a');a.href=href;a.download=filename;
-        document.body.appendChild(a);a.click();a.remove();
-        setTimeout(function() { URL.revokeObjectURL(href); },60000);
+    function saveBlob(blob, filename) {
+        var href = URL.createObjectURL(blob), a = make('a'); a.href = href; a.download = filename;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function() { URL.revokeObjectURL(href); }, 60000);
     }
     async function exportTrack(idx) {
-        var base=trackOrder[idx]; if (!base || !trackGroups[base]) return false;
-        activeIndex=idx;setStatus('Preparing Stem '+(idx+1)+'…');
-        await new Promise(function(resolve) { setTimeout(resolve,30); });
+        var base = trackOrder[idx]; if (!base || !trackGroups[base]) return false;
+        activeIndex = idx; setStatus('Preparing Stem ' + (idx + 1) + '…');
+        await yieldToUI(); await pause(30);
         try {
-            var joined=await decodeAndJoin(base), blob=encodeMP3(joined), ext='mp3';
-            if (!blob) { blob=encodeWAV(joined);ext='wav'; }
-            saveBlob(blob,'stem_'+(idx+1)+'.'+ext);
-            setStatus('Download started for Stem '+(idx+1)+'.');return true;
+            var joined = await decodeAndJoin(base), blob = await encodeMP3(joined), ext = 'mp3';
+            if (!blob) { blob = await encodeWAV(joined); ext = 'wav'; }
+            saveBlob(blob, 'stem_' + (idx + 1) + '.' + ext);
+            setStatus('Download started for Stem ' + (idx + 1) + '.'); return true;
         } catch (err) {
-            console.error('[Stem Downloader]',err);
-            setStatus('Couldn’t save Stem '+(idx+1)+'. '+(err.message || 'Try playing it again.'),'error');return false;
+            console.error('[Stem Downloader]', err);
+            setStatus('Couldn’t save Stem ' + (idx + 1) + '. ' + (err.message || 'Try playing it again.'), 'error'); return false;
         }
     }
     async function downloadTrack(idx) {
-        if (busy) return;busy=true;
+        if (busy) return; busy = true;
         try { await exportTrack(idx); }
-        finally { busy=false;activeIndex=-1;refreshPanel(); }
+        finally { busy = false; activeIndex = -1; refreshPanel(); }
     }
     async function downloadAll() {
-        if (busy) return;busy=true;var count=trackOrder.length, saved=0;
+        if (busy) return; busy = true; var count = trackOrder.length, saved = 0;
         try {
-            for (var i=0;i<count;i++) if (await exportTrack(i)) saved++;
-            setStatus(saved===count ? 'Downloads started. Allow multiple downloads if your browser asks.' : saved+' of '+count+' downloads started. Try the others again.', saved===count ? '' : 'error');
-        } finally { busy=false;activeIndex=-1;refreshPanel(); }
+            for (var i = 0; i < count; i++) {
+                if (await exportTrack(i)) saved++;
+                await pause(250); // gives the browser room between downloads
+            }
+            setStatus(saved === count ? 'Downloads started. Allow multiple downloads if your browser asks.' : saved + ' of ' + count + ' downloads started. Try the others again.', saved === count ? '' : 'error');
+        } finally { busy = false; activeIndex = -1; refreshPanel(); }
     }
-    function captureSegment(url,getBuffer) {
-        var parsed=parseSegmentURL(url);if (!parsed) return;
-        var token=generation;
+
+    function captureSegment(url, getBuffer) {
+        var parsed = parseSegmentURL(url); if (!parsed) return;
+        var token = generation;
         getBuffer().then(function(buffer) {
-            if (token!==generation || !buffer || !buffer.byteLength) return;
-            if (!trackGroups[parsed.base]) {trackGroups[parsed.base]=Object.create(null);trackOrder.push(parsed.base);}
-            trackGroups[parsed.base][parsed.num]=buffer;queueRefresh();
+            if (token !== generation || !buffer || !buffer.byteLength) return;
+            if (!trackGroups[parsed.base]) { trackGroups[parsed.base] = Object.create(null); trackOrder.push(parsed.base); }
+            trackGroups[parsed.base][parsed.num] = buffer; queueRefresh();
         }).catch(function() {});
     }
-    var origFetch=window.fetch;
-    if (origFetch) window.fetch=function() {
-        var args=arguments,input=args[0];
-        var url=typeof input==='string'?input:((input && input.url) || String(input || ''));
-        return origFetch.apply(this,args).then(function(response) {
+    var origFetch = window.fetch;
+    if (origFetch) window.fetch = function() {
+        var args = arguments, input = args[0];
+        var url = typeof input === 'string' ? input : ((input && input.url) || String(input || ''));
+        return origFetch.apply(this, args).then(function(response) {
             if (response.ok && isSegmentURL(url)) {
-                try { var clone=response.clone();captureSegment(url,function() {return clone.arrayBuffer();}); } catch (e) {}
+                try { var clone = response.clone(); captureSegment(url, function() { return clone.arrayBuffer(); }); } catch (e) {}
             }
             return response;
         });
     };
-    var origOpen=XMLHttpRequest.prototype.open,origSend=XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open=function(method,url) {this._stemUrl=String(url || '');return origOpen.apply(this,arguments);};
-    XMLHttpRequest.prototype.send=function() {
-        var self=this,url=self._stemUrl;
+    var origOpen = XMLHttpRequest.prototype.open, origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url) { this._stemUrl = String(url || ''); return origOpen.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function() {
+        var self = this, url = self._stemUrl;
         if (isSegmentURL(url)) {
-            try { if (self.responseType==='' || self.responseType==='text') self.responseType='arraybuffer'; } catch (e) {}
-            self.addEventListener('load',function() {
-                if (self.status<200 || self.status>=300) return;
-                var response=self.response;
-                if (response instanceof ArrayBuffer) captureSegment(url,function() {return Promise.resolve(response.slice(0));});
-                else if (response instanceof Blob) captureSegment(url,function() {return response.arrayBuffer();});
-            },{once:true});
+            try { if (self.responseType === '' || self.responseType === 'text') self.responseType = 'arraybuffer'; } catch (e) {}
+            self.addEventListener('load', function() {
+                if (self.status < 200 || self.status >= 300) return;
+                var response = self.response;
+                if (response instanceof ArrayBuffer) captureSegment(url, function() { return Promise.resolve(response.slice(0)); });
+                else if (response instanceof Blob) captureSegment(url, function() { return response.arrayBuffer(); });
+            }, {once: true});
         }
-        return origSend.apply(this,arguments);
+        return origSend.apply(this, arguments);
     };
-    if (document.readyState==='loading') document.addEventListener('DOMContentLoaded',refreshPanel,{once:true});
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', refreshPanel, {once: true});
     else refreshPanel();
-    setInterval(function() { if (document.body && (!panel || !panel.isConnected)) refreshPanel(); },1000);
+    setInterval(function() { if (document.body && (!panel || !panel.isConnected)) refreshPanel(); }, 1000);
 })();
-
 ```
 </details>
 

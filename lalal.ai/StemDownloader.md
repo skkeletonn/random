@@ -11,11 +11,10 @@ How to use this script:
 // ==UserScript==
 // @name         LALAL.ai Stem Downloader
 // @namespace    stemdownloader
-// @version      1.5.0
+// @version      1.6.0
 // @description  A compact, plain-language panel for saving captured LALAL.ai stems.
 // @match        *://www.lalal.ai/*
 // @match        *://lalal.ai/*
-// @require      https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
@@ -23,7 +22,6 @@ How to use this script:
 (function () {
     'use strict';
     var JOIN_TRIM_MS = 10;
-    var MP3_BITRATE_KBPS = 192;
 
     var trackGroups = Object.create(null);
     var trackOrder = [];
@@ -104,10 +102,6 @@ How to use this script:
 @media(prefers-reduced-motion:reduce){#stem-dl-panel *{transition:none!important}}
 `;
 
-    function getLame() {
-        return typeof lamejs !== 'undefined' ? lamejs : window.lamejs;
-    }
-    function hasMP3() { var lib = getLame(); return !!(lib && lib.Mp3Encoder); }
     function make(tag, className, text) {
         var el = document.createElement(tag);
         if (className) el.className = className;
@@ -188,7 +182,7 @@ How to use this script:
             }
             var footer = make('div', 'sd-footer');
             var format = make('span', 'sd-format', 'File type ');
-            format.appendChild(make('b', '', hasMP3() ? 'MP3' : 'WAV')); footer.appendChild(format);
+            format.appendChild(make('b', '', 'WAV')); footer.appendChild(format);
             if (trackOrder.length) {
                 var reset = makeButton('Clear list', 'sd-reset', function() {
                     if (busy || !confirm('Clear the collected audio? Play it again to collect it.')) return;
@@ -202,7 +196,7 @@ How to use this script:
             var help = make('div', 'sd-help');
             help.appendChild(make('p', '', 'Stems are numbered as they arrive. Listen to tell which one is vocals, music, or another part.'));
             help.appendChild(make('p', '', 'Only collected audio is saved. The part count does not confirm that the whole track is here.'));
-            help.appendChild(make('p', '', hasMP3() ? 'Files save as 192 kbps MP3.' : 'MP3 export is unavailable, so files save as WAV. WAV does not improve the source quality.'));
+            help.appendChild(make('p', '', 'Files save as WAV. They are bigger than the MP3 preview but save fast, with no extra quality loss.'));
             help.appendChild(make('p', '', 'Each join between parts trims ' + JOIN_TRIM_MS + ' ms. If a join sounds cut off, change JOIN_TRIM_MS at the top of the script.'));
             details.appendChild(help); details.addEventListener('toggle', function() { detailsOpen = details.open; }); panel.appendChild(details);
             var status = make('div', 'sd-status', statusMessage); status.dataset.kind = statusKind;
@@ -260,11 +254,11 @@ How to use this script:
         var ctx = getAudioContext();
         if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) {} }
 
-        // Decode one part at a time so CPU spikes and memory use stay small.
+        // Decode a few parts at a time (the browser decodes them off the main thread).
         var decoded = [];
-        for (var n = 0; n < nums.length; n++) {
-            decoded.push(await decodeAudio(ctx, segments[nums[n]].slice(0)));
-            await yieldToUI();
+        for (var n = 0; n < nums.length; n += 4) {
+            var batch = nums.slice(n, n + 4).map(function(k) { return decodeAudio(ctx, segments[k].slice(0)); });
+            decoded.push.apply(decoded, await Promise.all(batch));
         }
         var sampleRate = decoded[0].sampleRate;
         if (decoded.some(function(b) { return b.sampleRate !== sampleRate; })) throw new Error('These audio parts could not be joined.');
@@ -296,51 +290,31 @@ How to use this script:
         }
         return {pcm: pcm, sampleRate: sampleRate, channels: channels};
     }
-    function floatToInt16(data) {
-        var out = new Int16Array(data.length);
-        for (var i = 0; i < data.length; i++) {
-            var value = Math.max(-1, Math.min(1, data[i]));
-            out[i] = value < 0 ? value * 32768 : value * 32767;
-        }
-        return out;
-    }
-    async function encodeMP3(joined) {
-        var lib = getLame(); if (!lib || !lib.Mp3Encoder) return null;
-        var encoder = new lib.Mp3Encoder(joined.channels, joined.sampleRate, MP3_BITRATE_KBPS);
-        var total = joined.pcm[0].length, stereo = joined.channels > 1;
-        var chunks = [], tick = makeSlicer(10);
-        for (var i = 0; i < total; i += 1152) {
-            var end = Math.min(i + 1152, total);
-            var l = floatToInt16(joined.pcm[0].subarray(i, end));
-            var data = stereo
-                ? encoder.encodeBuffer(l, floatToInt16(joined.pcm[1].subarray(i, end)))
-                : encoder.encodeBuffer(l);
-            if (data.length) chunks.push(new Int8Array(data));
-            await tick();
-        }
-        var last = encoder.flush(); if (last.length) chunks.push(new Int8Array(last));
-        return new Blob(chunks, {type: 'audio/mpeg'});
-    }
     async function encodeWAV(joined) {
         var channels = joined.channels, frames = joined.pcm[0].length;
-        var blockAlign = channels * 2, dataSize = frames * blockAlign;
+        var dataSize = frames * channels * 2;
         if (dataSize > 0xffffffff - 36) throw new Error('This audio is too large for one WAV file.');
-        var buffer = new ArrayBuffer(44 + dataSize), view = new DataView(buffer);
-        function ascii(offset, text) { for (var i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i)); }
+        var header = new ArrayBuffer(44), view = new DataView(header);
+        function ascii(offset, text) { for (var k = 0; k < text.length; k++) view.setUint8(offset + k, text.charCodeAt(k)); }
+        var blockAlign = channels * 2;
         ascii(0,'RIFF'); view.setUint32(4,36+dataSize,true); ascii(8,'WAVE'); ascii(12,'fmt ');
         view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,channels,true);
         view.setUint32(24,joined.sampleRate,true); view.setUint32(28,joined.sampleRate*blockAlign,true);
         view.setUint16(32,blockAlign,true); view.setUint16(34,16,true); ascii(36,'data'); view.setUint32(40,dataSize,true);
-        var offset = 44, tick = makeSlicer(10);
-        for (var start = 0; start < frames; start += 8192) {
-            var stop = Math.min(start + 8192, frames);
-            for (var i = start; i < stop; i++) for (var ch = 0; ch < channels; ch++) {
-                var value = Math.max(-1, Math.min(1, joined.pcm[ch][i]));
-                view.setInt16(offset, value < 0 ? value * 32768 : value * 32767, true); offset += 2;
+
+        var samples = new Int16Array(frames * channels), tick = makeSlicer(15);
+        for (var start = 0; start < frames; start += 32768) {
+            var stop = Math.min(start + 32768, frames);
+            for (var ch = 0; ch < channels; ch++) {
+                var src = joined.pcm[ch];
+                for (var i = start, o = start * channels + ch; i < stop; i++, o += channels) {
+                    var v = src[i]; v = v < -1 ? -1 : (v > 1 ? 1 : v);
+                    samples[o] = v < 0 ? v * 32768 : v * 32767;
+                }
             }
             await tick();
         }
-        return new Blob([buffer], {type: 'audio/wav'});
+        return new Blob([header, samples], {type: 'audio/wav'});
     }
     function saveBlob(blob, filename) {
         var href = URL.createObjectURL(blob), a = make('a'); a.href = href; a.download = filename;
@@ -350,11 +324,10 @@ How to use this script:
     async function exportTrack(idx) {
         var base = trackOrder[idx]; if (!base || !trackGroups[base]) return false;
         activeIndex = idx; setStatus('Preparing Stem ' + (idx + 1) + '…');
-        await yieldToUI(); await pause(30);
+        await yieldToUI();
         try {
-            var joined = await decodeAndJoin(base), blob = await encodeMP3(joined), ext = 'mp3';
-            if (!blob) { blob = await encodeWAV(joined); ext = 'wav'; }
-            saveBlob(blob, 'stem_' + (idx + 1) + '.' + ext);
+            var joined = await decodeAndJoin(base), blob = await encodeWAV(joined);
+            saveBlob(blob, 'stem_' + (idx + 1) + '.wav');
             setStatus('Download started for Stem ' + (idx + 1) + '.'); return true;
         } catch (err) {
             console.error('[Stem Downloader]', err);
@@ -371,7 +344,7 @@ How to use this script:
         try {
             for (var i = 0; i < count; i++) {
                 if (await exportTrack(i)) saved++;
-                await pause(250); // gives the browser room between downloads
+                await pause(150); // gives the browser room between downloads
             }
             setStatus(saved === count ? 'Downloads started. Allow multiple downloads if your browser asks.' : saved + ' of ' + count + ' downloads started. Try the others again.', saved === count ? '' : 'error');
         } finally { busy = false; activeIndex = -1; refreshPanel(); }

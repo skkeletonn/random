@@ -8,7 +8,7 @@ make a discord webhook
 copy the webhook url
 put the webhooks url in the 'Your Discord Webhook Link Here!'
 
-this basically makes your bot start sending the chat messages from the server ur in
+this basically makes your discord bot start sending the chat messages from the roblox server ur in
 --]]
 
 local HttpService = game:GetService("HttpService")
